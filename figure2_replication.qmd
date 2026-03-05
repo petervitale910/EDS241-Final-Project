@@ -63,11 +63,12 @@ add_common_theme <- theme_bw() +
 prepare_panel <- function(file, panel_type, group_id_var, outcome = "percPlasticBag",
                           drop_years = NULL, treated_only = FALSE,
                           single_treatment = FALSE, use_grocery = FALSE) {
-
+# Stop if file is not found 
   if (!file.exists(file)) stop("File not found: ", file)
   e <- new.env()
-  load(file, envir = e)
+  load(file, envir = e) # Load desired file
 
+  # If you want balanced, it checks that the data is balanced
   if (panel_type == "balanced") {
     if (exists("dataBalanced", envir = e)) {
       data <- e$dataBalanced
@@ -75,6 +76,7 @@ prepare_panel <- function(file, panel_type, group_id_var, outcome = "percPlastic
       stop("No 'dataBalanced' object in: ", basename(file),
            "\nObjects found: ", paste(ls(e), collapse = ", "))
     }
+    # If not we just want data
   } else {
     if (exists("data", envir = e)) {
       data <- e$data
@@ -84,10 +86,16 @@ prepare_panel <- function(file, panel_type, group_id_var, outcome = "percPlastic
       data <- get(obj, envir = e)
     }
   }
-
+# If the use of 'grocery' bags is 1  make percent plastic bag the same
   if (use_grocery) data <- data %>% mutate(percPlasticBag = percGroceryBag)
+  
+# If we want to drop years this lets us do that (the paper discusses wanting to drop covid)
   if (!is.null(drop_years)) data <- data %>% filter(!year %in% drop_years)
+  
+# If we only want treated, then we only take treated
   if (treated_only) data <- data %>% filter(type != "control")
+  
+# Create single treatment effect
   if (single_treatment) {
     data <- data %>%
       filter(lastPolicyID == firstPolicyID |
@@ -116,9 +124,9 @@ prepare_panel <- function(file, panel_type, group_id_var, outcome = "percPlastic
       treat      = treatedAny,
       treatEver  = sum(treatedAny) > 0,
       timeToTreat = if_else(treatEver, time - firstY, 0),
-      firstSA    = if_else(treatEver, firstY + 1, 10000),
-      treatDCDH  = treatedAny == 1 & time >= firstY,
-      firstCS    = if_else(is.na(firstY), 0, firstY + 1)
+      firstSA    = if_else(treatEver, firstY + 1, 10000), # No treatment -> no first year
+      treatDCDH  = treatedAny == 1 & time >= firstY, 
+      firstCS    = if_else(is.na(firstY), 0, firstY + 1) # First cleanyo 
     ) %>%
     ungroup()
 
@@ -152,11 +160,17 @@ run_static_estimators <- function(dataMain, group_id_var,
   fml <- as.formula(paste0(
     "percPlasticBag ~ treat | factor(time) + factor(", group_id_var, ") | 0 | zip"
   ))
+  
+  # Fit a linear model with multiple fixed effects
   m <- felm(fml, data = dataMain)
+  
+  # Summarizes information about model components
   r <- tidy(m, conf.int = TRUE) %>%
     mutate(model = "TWFE") %>%
     dplyr::select(model, estimate, std.error)
   results[["TWFE"]] <- r
+  
+  # ADD TEXT AS TO WHY
 
   # ---- 2. de Chaisemartin & D'Haultfoeuille 2020 ----
   dcdh <- did_multiplegt(df = dataMain, Y = "percPlasticBag",
@@ -169,6 +183,8 @@ run_static_estimators <- function(dataMain, group_id_var,
     std.error  = dcdh$se_effect
   )
 
+ # ADD TEXT AS TO WHY
+  
   # ---- 3. Callaway & Sant'Anna 2021 ----
   atts <- att_gt(data = dataMain, yname = "percPlasticBag",
                  tname = "time", idname = group_id_var,
@@ -183,6 +199,8 @@ run_static_estimators <- function(dataMain, group_id_var,
     estimate  = agg$overall.att,
     std.error = agg$overall.se
   )
+
+# ADD TEXT AS TO WHY
 
   # ---- 4. Sun & Abraham 2021 ----
   dataSA <- dataMain
@@ -200,7 +218,9 @@ run_static_estimators <- function(dataMain, group_id_var,
     estimate  = sa_agg[1],
     std.error = sa_agg[2]
   )
-
+  
+  # ADD TEXT AS TO WHY  
+  
   # ---- 5. Borusyak et al. 2021 ----
   bor <- did_imputation(data = dataMain, yname = "percPlasticBag",
                         gname = "firstY", tname = "time",
@@ -232,6 +252,7 @@ run_static_estimators <- function(dataMain, group_id_var,
     )
 }
 
+# ADD TEXT AS TO WHY
 
 # ==============================================================
 # HELPER: DYNAMIC ESTIMATORS (event-study)
@@ -255,6 +276,7 @@ run_dynamic_estimators <- function(dataMain, group_id_var,
     "percPlasticBag ~ i(timeToTreat, treatEver, ref = 0) | ",
     group_id_var, " + time"
   ))
+  
   tw <- feols(fml, cluster = as.formula(paste0("~", group_id_var)),
               data = dataMain)
   r <- tidy(tw, conf.int = TRUE) %>%
