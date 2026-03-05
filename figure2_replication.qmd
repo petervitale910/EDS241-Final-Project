@@ -1,0 +1,531 @@
+---
+title: "Figure 2 Replication"
+format: html
+editor: visual
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(fixest)
+library(lfe)
+library(broom)
+library(stringr)
+library(here)
+library(patchwork)
+library(did)
+library(didimputation)
+library(DIDmultiplegt)
+library(DIDmultiplegtDYN)
+library(scales)
+library(lubridate)
+library(ggpubr)
+library(gridExtra)
+```
+
+```{r theme}
+# ==============================================================
+# PLOT THEME
+# ==============================================================
+
+textSize <- 15
+palette  <- gray.colors(5, start = 0.0, end = 0.65, gamma = 2.2, rev = FALSE)
+
+add_common_theme <- theme_bw() +
+  theme(
+    legend.position    = "bottom",
+    axis.text.x        = element_text(size = textSize - 6),
+    axis.text.y        = element_text(size = textSize),
+    axis.title.x       = element_text(size = textSize),
+    axis.title.y       = element_text(size = textSize,
+                                      margin = margin(t=0,r=0,b=0,l=-4)),
+    legend.text        = element_text(size = textSize - 3),
+    legend.title       = element_text(size = textSize - 3),
+    legend.margin      = margin(0,0,0,0),
+    legend.spacing.x   = unit(0, "mm"),
+    legend.spacing.y   = unit(0, "mm"),
+    panel.grid.major   = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.border       = element_blank(),
+    axis.line          = element_line(colour = "black"),
+    axis.ticks         = element_line(linewidth = 1),
+    axis.ticks.x       = element_blank(),
+    axis.ticks.length  = unit(0.15, "cm"),
+    plot.title         = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle      = element_text(hjust = 0.5)
+  )
+
+
+# ==============================================================
+# HELPER: PREPARE PANEL DATA
+# ==============================================================
+
+prepare_panel <- function(file, panel_type, group_id_var, outcome = "percPlasticBag",
+                          drop_years = NULL, treated_only = FALSE,
+                          single_treatment = FALSE, use_grocery = FALSE) {
+
+  if (!file.exists(file)) stop("File not found: ", file)
+  e <- new.env()
+  load(file, envir = e)
+
+  if (panel_type == "balanced") {
+    if (exists("dataBalanced", envir = e)) {
+      data <- e$dataBalanced
+    } else {
+      stop("No 'dataBalanced' object in: ", basename(file),
+           "\nObjects found: ", paste(ls(e), collapse = ", "))
+    }
+  } else {
+    if (exists("data", envir = e)) {
+      data <- e$data
+    } else {
+      obj <- ls(e)[1]
+      message("No 'data' object found; using '", obj, "' from ", basename(file))
+      data <- get(obj, envir = e)
+    }
+  }
+
+  if (use_grocery) data <- data %>% mutate(percPlasticBag = percGroceryBag)
+  if (!is.null(drop_years)) data <- data %>% filter(!year %in% drop_years)
+  if (treated_only) data <- data %>% filter(type != "control")
+  if (single_treatment) {
+    data <- data %>%
+      filter(lastPolicyID == firstPolicyID |
+             is.na(lastPolicyID) | is.na(firstPolicyID))
+  }
+
+  # Numeric time (year-level only for Figure 2)
+  data <- data %>% mutate(time = year)
+
+  # First treatment year — convert outside mutate to avoid recycling issues
+  fe <- data$firstEffect
+  if (inherits(fe, "POSIXct") || inherits(fe, "Date")) {
+    data$firstY <- as.numeric(format(as.Date(fe), "%Y"))
+  } else {
+    data$firstY <- suppressWarnings(as.numeric(as.character(fe)))
+  }
+
+  # Filter to relevant types
+  dataMain <- data %>%
+    filter(type %in% c("charge", "complete", "partial", "control"))
+
+  # Group-level treatment variables
+  dataMain <- dataMain %>%
+    group_by(!!sym(group_id_var)) %>%
+    mutate(
+      treat      = treatedAny,
+      treatEver  = sum(treatedAny) > 0,
+      timeToTreat = if_else(treatEver, time - firstY, 0),
+      firstSA    = if_else(treatEver, firstY + 1, 10000),
+      treatDCDH  = treatedAny == 1 & time >= firstY,
+      firstCS    = if_else(is.na(firstY), 0, firstY + 1)
+    ) %>%
+    ungroup()
+
+  # Drop units with inconsistent firstCS (varying treatment cohort)
+  dataMain <- dataMain %>%
+    group_by(!!sym(group_id_var)) %>%
+    mutate(min_cs = min(firstCS), max_cs = max(firstCS)) %>%
+    ungroup() %>%
+    filter(min_cs == max_cs)
+
+  dataMain %>% arrange(!!sym(group_id_var), time)
+}
+
+
+# ==============================================================
+# HELPER: ALL 5 ESTIMATORS (static / overall ATT)
+# ==============================================================
+
+run_static_estimators <- function(dataMain, group_id_var,
+                                  drop_sa_years = NULL) {
+
+  # Control mean
+  control_mean <- dataMain %>%
+    filter(type == "control") %>%
+    summarise(m = mean(percPlasticBag, na.rm = TRUE)) %>%
+    pull(m)
+
+  results <- list()
+
+  # ---- 1. TWFE ----
+  fml <- as.formula(paste0(
+    "percPlasticBag ~ treat | factor(time) + factor(", group_id_var, ") | 0 | zip"
+  ))
+  m <- felm(fml, data = dataMain)
+  r <- tidy(m, conf.int = TRUE) %>%
+    mutate(model = "TWFE") %>%
+    dplyr::select(model, estimate, std.error)
+  results[["TWFE"]] <- r
+
+  # ---- 2. de Chaisemartin & D'Haultfoeuille 2020 ----
+  dcdh <- did_multiplegt(df = dataMain, Y = "percPlasticBag",
+                         T = "time", G = group_id_var,
+                         D = "treatDCDH", cluster = "zip",
+                         brep = 100, parallel = TRUE)
+  results[["DCDH"]] <- data.frame(
+    model      = "de Chaisemartin and D'Haultfoeuille (2020)",
+    estimate   = dcdh$effect,
+    std.error  = dcdh$se_effect
+  )
+
+  # ---- 3. Callaway & Sant'Anna 2021 ----
+  atts <- att_gt(data = dataMain, yname = "percPlasticBag",
+                 tname = "time", idname = group_id_var,
+                 gname = "firstCS", clustervars = "zip",
+                 control_group = "notyettreated",
+                 bstrap = TRUE, biters = 1000,
+                 allow_unbalanced_panel = TRUE, panel = TRUE,
+                 base_period = "universal")
+  agg  <- aggte(atts, type = "group", na.rm = TRUE)
+  results[["CS"]] <- data.frame(
+    model     = "Callaway and Santanna (2021)",
+    estimate  = agg$overall.att,
+    std.error = agg$overall.se
+  )
+
+  # ---- 4. Sun & Abraham 2021 ----
+  dataSA <- dataMain
+  if (!is.null(drop_sa_years)) {
+    drop_cohorts <- drop_sa_years + 1          # firstSA = firstY + 1
+    dataSA <- dataSA %>% filter(!firstSA %in% drop_cohorts)
+  }
+  fml_sa <- as.formula(paste0(
+    "percPlasticBag ~ sunab(firstSA, time) | factor(", group_id_var, ") + factor(time)"
+  ))
+  sa_mod <- feols(fml_sa, cluster = "zip", data = dataSA)
+  sa_agg <- aggregate(sa_mod, "att")
+  results[["SA"]] <- data.frame(
+    model     = "Sun and Abraham (2021)",
+    estimate  = sa_agg[1],
+    std.error = sa_agg[2]
+  )
+
+  # ---- 5. Borusyak et al. 2021 ----
+  bor <- did_imputation(data = dataMain, yname = "percPlasticBag",
+                        gname = "firstY", tname = "time",
+                        idname = group_id_var, cluster_var = "zip")
+  results[["BOR"]] <- data.frame(
+    model     = "Borusyak et al. (2021)",
+    estimate  = bor$estimate,
+    std.error = bor$std.error
+  )
+
+  # ---- Combine & normalise ----
+  bind_rows(results) %>%
+    mutate(
+      estimate   = estimate   / control_mean,
+      std.error  = std.error  / control_mean,
+      confLow    = (estimate - 1.96  * std.error) * 100,
+      confHigh   = (estimate + 1.96  * std.error) * 100,
+      confLow90  = (estimate - 1.645 * std.error) * 100,
+      confHigh90 = (estimate + 1.645 * std.error) * 100,
+      estimate   = estimate * 100,
+      std.error  = std.error * 100,
+      model = factor(model, levels = c(
+        "TWFE",
+        "Callaway and Santanna (2021)",
+        "de Chaisemartin and D'Haultfoeuille (2020)",
+        "Sun and Abraham (2021)",
+        "Borusyak et al. (2021)"
+      ))
+    )
+}
+
+
+# ==============================================================
+# HELPER: DYNAMIC ESTIMATORS (event-study)
+# ==============================================================
+
+run_dynamic_estimators <- function(dataMain, group_id_var,
+                                   drop_sa_years = NULL,
+                                   window = c(-3, 5)) {
+
+  lo <- window[1]; hi <- window[2]
+
+  control_mean <- dataMain %>%
+    filter(treatEver == FALSE) %>%
+    summarise(m = mean(percPlasticBag, na.rm = TRUE)) %>%
+    pull(m)
+
+  results <- list()
+
+  # ---- 1. TWFE ----
+  fml <- as.formula(paste0(
+    "percPlasticBag ~ i(timeToTreat, treatEver, ref = 0) | ",
+    group_id_var, " + time"
+  ))
+  tw <- feols(fml, cluster = as.formula(paste0("~", group_id_var)),
+              data = dataMain)
+  r <- tidy(tw, conf.int = TRUE) %>%
+    mutate(
+      model = "TWFE",
+      time  = as.numeric(str_extract(term, "(?<=timeToTreat::).*?(?=:treatEver)"))
+    ) %>%
+    filter(time >= lo & time <= hi) %>%
+    dplyr::select(model, time, estimate, se = std.error,
+                  confLow = conf.low, confHigh = conf.high)
+  # Add ref = 0
+  r <- bind_rows(r, data.frame(model="TWFE", time=0,
+                               estimate=0, se=0, confLow=0, confHigh=0))
+  results[["TWFE"]] <- r
+
+  # ---- 2. Callaway & Sant'Anna 2021 ----
+  atts <- att_gt(data = dataMain, yname = "percPlasticBag",
+                 tname = "time", idname = group_id_var,
+                 gname = "firstCS", clustervars = "zip",
+                 control_group = "notyettreated",
+                 bstrap = TRUE, biters = 1000,
+                 allow_unbalanced_panel = TRUE, panel = TRUE,
+                 base_period = "universal")
+  agg_es <- aggte(atts, type = "dynamic")
+  r <- tidy(agg_es, conf.int = TRUE) %>%
+    mutate(
+      model = "Callaway and Santanna (2021)",
+      time  = event.time + 1          # match original script convention
+    ) %>%
+    filter(time >= lo & time <= hi) %>%
+    dplyr::select(model, time, estimate, se = std.error,
+                  confLow = point.conf.low, confHigh = point.conf.high)
+  r <- r %>% mutate(across(c(estimate, se, confLow, confHigh),
+                            ~ if_else(time == 0, 0, .)))
+  results[["CS"]] <- r
+
+  # ---- 3. de Chaisemartin & D'Haultfoeuille 2020 ----
+  # Skipped in dynamic: requires DIDmultiplegtDYN which needs Java/polars on this system.
+  # Present in static estimates via did_multiplegt v0.1.0.
+
+  # ---- 4. Sun & Abraham 2021 ----
+  dataSA <- dataMain
+  if (!is.null(drop_sa_years)) {
+    drop_cohorts <- drop_sa_years + 1
+    dataSA <- dataSA %>% filter(!firstSA %in% drop_cohorts)
+  }
+  fml_sa <- as.formula(paste0(
+    "percPlasticBag ~ sunab(firstSA, time) | factor(", group_id_var, ") + factor(time)"
+  ))
+  sa <- feols(fml_sa, cluster = as.formula(paste0("~", group_id_var)),
+              data = dataSA)
+  r <- tidy(sa, conf.int = TRUE) %>%
+    mutate(
+      model = "Sun and Abraham (2021)",
+      time  = as.numeric(str_extract(term, "(?<=time::).*")) + 1
+    ) %>%
+    filter(time >= lo & time <= hi) %>%
+    dplyr::select(model, time, estimate, se = std.error,
+                  confLow = conf.low, confHigh = conf.high)
+  r <- bind_rows(r, data.frame(model="Sun and Abraham (2021)", time=0,
+                               estimate=0, se=0, confLow=0, confHigh=0))
+  results[["SA"]] <- r
+
+  # ---- Combine & normalise ----
+  bind_rows(results) %>%
+    mutate(across(c(estimate, se, confLow, confHigh),
+                  ~ as.numeric(.) / control_mean * 100)) %>%
+    mutate(
+      confLow90  = estimate - 1.645 * se,
+      confHigh90 = estimate + 1.645 * se,
+      model = factor(model, levels = c(
+        "TWFE",
+        "Callaway and Santanna (2021)",
+        "Sun and Abraham (2021)"
+      ))
+    ) %>%
+    filter(time < hi + 1)
+}
+```
+
+```{r run, cache=FALSE, message=FALSE, warning=FALSE}
+# ==============================================================
+# RUN — UNBALANCED PANEL
+# ==============================================================
+
+data_unbal_cell <- prepare_panel(
+  file         = here("replication_shared","data","processed","02_merged_bigcell_year.rda"),
+  panel_type   = "unbalanced",
+  group_id_var = "groupID1"
+)
+
+data_unbal_zip <- prepare_panel(
+  file         = here("replication_shared","data","processed","02_merged_zip_year.rda"),
+  panel_type   = "unbalanced",
+  group_id_var = "zip"
+)
+
+static_unbal_cell <- run_static_estimators(data_unbal_cell, "groupID1") %>%
+  mutate(version = "0.1° Cell x Year", x = 0)
+static_unbal_zip  <- run_static_estimators(data_unbal_zip,  "zip")       %>%
+  mutate(version = "Zip Code x Year",  x = 1)
+static_unbal <- bind_rows(static_unbal_cell, static_unbal_zip)
+
+dynamic_unbal <- run_dynamic_estimators(data_unbal_cell, "groupID1")
+
+count_unbal_cell <- sum(data_unbal_cell$cleanupCount)
+nobs_unbal_cell  <- nrow(data_unbal_cell)
+count_unbal_zip  <- sum(data_unbal_zip$cleanupCount)
+nobs_unbal_zip   <- nrow(data_unbal_zip)
+
+# ==============================================================
+# RUN — BALANCED PANEL
+# ==============================================================
+
+data_bal_cell <- prepare_panel(
+  file         = here("replication_shared","data","processed","02_merged_bigcell_year_balanced.rda"),
+  panel_type   = "balanced",
+  group_id_var = "groupID1"
+)
+
+data_bal_zip <- prepare_panel(
+  file         = here("replication_shared","data","processed","02_merged_zip_year_balanced.rda"),
+  panel_type   = "balanced",
+  group_id_var = "zip"
+)
+
+static_bal_cell <- run_static_estimators(data_bal_cell, "groupID1") %>%
+  mutate(version = "0.1° Cell x Year", x = 0)
+static_bal_zip  <- run_static_estimators(data_bal_zip,  "zip")       %>%
+  mutate(version = "Zip Code x Year",  x = 1)
+static_bal <- bind_rows(static_bal_cell, static_bal_zip)
+
+dynamic_bal <- run_dynamic_estimators(data_bal_cell, "groupID1")
+
+count_bal_cell <- sum(data_bal_cell$cleanupCount)
+nobs_bal_cell  <- nrow(data_bal_cell)
+count_bal_zip  <- sum(data_bal_zip$cleanupCount)
+nobs_bal_zip   <- nrow(data_bal_zip)
+```
+
+```{r plots}
+# ==============================================================
+# PLOTS
+# ==============================================================
+
+x_labels_unbal <- c(
+  paste0("0.1° Cell x Year\n Cleanups = ", comma(count_unbal_cell),
+         "\n Obs = ", comma(nobs_unbal_cell)),
+  paste0("Zip Code x Year\n Cleanups = ", comma(count_unbal_zip),
+         "\n Obs = ", comma(nobs_unbal_zip))
+)
+
+x_labels_bal <- c(
+  paste0("0.1° Cell x Year\n Cleanups = ", comma(count_bal_cell),
+         "\n Obs = ", comma(nobs_bal_cell)),
+  paste0("Zip Code x Year\n Cleanups = ", comma(count_bal_zip),
+         "\n Obs = ", comma(nobs_bal_zip))
+)
+
+# ---- Panel A: Overall, Unbalanced ----
+a <- ggplot(static_unbal, aes(x = x, y = estimate, color = model, shape = model)) +
+  geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.2) +
+  geom_errorbar(aes(ymin = confLow, ymax = confHigh),
+                width = 0.25, position = position_dodge(0.5)) +
+  geom_linerange(aes(ymin = confLow90, ymax = confHigh90),
+                 size = 3, alpha = 0.35, position = position_dodge(0.5)) +
+  geom_point(size = 4, position = position_dodge(0.5)) +
+  scale_color_manual(name = "Estimator", values = palette) +
+  scale_shape_manual(name = "Estimator", values = c(16, 17, 4, 15, 1)) +
+  guides(color = guide_legend(override.aes = list(shape = c(16,17,4,15,1)),
+                              nrow = 3)) +
+  scale_x_continuous(limits = c(-0.5, 1.5), breaks = c(0,1),
+                     labels = x_labels_unbal) +
+  scale_y_continuous(breaks = seq(-100, 50, 25), limits = c(-100, 50)) +
+  labs(y = "Plastic Bags (Share of Items)\n∆ Relative to Control Mean (%)",
+       x = "Aggregation Level",
+       title = "Overall Effects", subtitle = "Unbalanced Panel") +
+  add_common_theme
+
+# ---- Panel C: Overall, Balanced ----
+c_plot <- ggplot(static_bal, aes(x = x, y = estimate, color = model, shape = model)) +
+  geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.2) +
+  geom_errorbar(aes(ymin = confLow, ymax = confHigh),
+                width = 0.25, position = position_dodge(0.5)) +
+  geom_linerange(aes(ymin = confLow90, ymax = confHigh90),
+                 size = 3, alpha = 0.35, position = position_dodge(0.5)) +
+  geom_point(size = 4, position = position_dodge(0.5)) +
+  scale_color_manual(name = "Estimator", values = palette) +
+  scale_shape_manual(name = "Estimator", values = c(16, 17, 4, 15, 1)) +
+  guides(color = guide_legend(override.aes = list(shape = c(16,17,4,15,1)),
+                              nrow = 3)) +
+  scale_x_continuous(limits = c(-0.5, 1.5), breaks = c(0,1),
+                     labels = x_labels_bal) +
+  scale_y_continuous(breaks = seq(-100, 50, 25), limits = c(-100, 50)) +
+  labs(y = "Plastic Bags (Share of Items)\n∆ Relative to Control Mean (%)",
+       x = "Aggregation Level",
+       title = "Overall Effects", subtitle = "Balanced Panel") +
+  add_common_theme
+
+# ---- Panel B: Dynamic, Unbalanced ----
+b <- ggplot(dynamic_unbal, aes(x = time, y = estimate, color = model, shape = model)) +
+  geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.2) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.2) +
+  geom_errorbar(aes(ymin = confLow, ymax = confHigh),
+                width = 0.5, position = position_dodge(0.6)) +
+  geom_linerange(aes(ymin = confLow90, ymax = confHigh90),
+                 size = 1.5, alpha = 0.35, position = position_dodge(0.6)) +
+  geom_point(size = 2, position = position_dodge(0.6)) +
+  scale_color_manual(name = "Estimator", values = palette[1:3]) +
+  scale_shape_manual(name = "Estimator", values = c(16, 17, 15)) +
+  guides(color = guide_legend(override.aes = list(shape = c(16,17,15)))) +
+  scale_x_continuous(breaks = seq(-3, 5, 1), limits = c(-3.5, 5.5)) +
+  scale_y_continuous(breaks = seq(-125, 75, 25), limits = c(-127.5, 85)) +
+  labs(y = "Plastic Bags (Share of Items)\n∆ Relative to Control Mean (%)",
+       x = "Years Since Policy",
+       title = "Dynamic Effects",
+       subtitle = "0.1° Cell x Year Aggregation; Unbalanced Panel") +
+  add_common_theme
+
+# ---- Panel D: Dynamic, Balanced ----
+d <- ggplot(dynamic_bal, aes(x = time, y = estimate, color = model, shape = model)) +
+  geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.2) +
+  geom_vline(xintercept = 0, colour = "grey60", linewidth = 0.2) +
+  geom_errorbar(aes(ymin = confLow, ymax = confHigh),
+                width = 0.5, position = position_dodge(0.6)) +
+  geom_linerange(aes(ymin = confLow90, ymax = confHigh90),
+                 size = 1.5, alpha = 0.35, position = position_dodge(0.6)) +
+  geom_point(size = 2, position = position_dodge(0.6)) +
+  scale_color_manual(name = "Estimator", values = palette[1:3]) +
+  scale_shape_manual(name = "Estimator", values = c(16, 17, 15)) +
+  guides(color = guide_legend(override.aes = list(shape = c(16,17,15)))) +
+  scale_x_continuous(breaks = seq(-3, 5, 1), limits = c(-3.5, 5.5)) +
+  scale_y_continuous(breaks = seq(-125, 75, 25), limits = c(-127.5, 85)) +
+  labs(y = "Plastic Bags (Share of Items)\n∆ Relative to Control Mean (%)",
+       x = "Years Since Policy",
+       title = "Dynamic Effects",
+       subtitle = "0.1° Cell x Year Aggregation; Balanced Panel") +
+  add_common_theme
+
+# ==============================================================
+# ASSEMBLE FIGURE
+# ==============================================================
+
+# Extract shared legend from panel a
+legend_paper <- get_legend(
+  a + guides(color = guide_legend(
+    nrow = 3, keywidth = 1,
+    override.aes = list(shape = c(16,17,4,15,1), linewidth = 0, alpha = 1)
+  ))
+)
+
+# Strip legends from panels
+a       <- a       + theme(legend.position = "none")
+c_plot  <- c_plot  + theme(legend.position = "none")
+b       <- b       + theme(legend.position = "none")
+d       <- d       + theme(legend.position = "none")
+
+arranged_plots <- ggarrange(
+  ggarrange(a,  NA, c_plot, ncol = 3, labels = c("A", "", "C"),
+            widths = c(2, 0.25, 2)),
+  NA,
+  ggarrange(b,  NA, d,      ncol = 3, labels = c("B", "", "D"),
+            widths = c(2, 0.25, 2)),
+  nrow = 3, heights = c(2, 0.25, 2)
+)
+
+final_plot <- grid.arrange(
+  grobs = list(arranged_plots, legend_paper),
+  layout_matrix = rbind(c(1), c(NA), c(2)),
+  heights = c(10, 0.5, 1)
+)
+
+ggsave("output/Figure2.jpeg", final_plot, width = 11, height = 10, unit = "in")
+```
